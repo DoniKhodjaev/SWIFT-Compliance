@@ -1,177 +1,84 @@
 interface SdnEntry {
-  firstName: string;
-  lastName: string;
-  fullName: string;
+  name: string;
+  name_variations: string[];
   type: string;
-  remarks?: string;
-  programs: string[];
-  addresses: string[];
-  ids: string[];
-  allText: string;
+  date_of_birth?: string;
+  id_number?: string; // Optional ID number for TIN comparison
 }
 
 export class OfacChecker {
   private static ofacList: SdnEntry[] = [];
-  private static SIMILARITY_THRESHOLD = 0.75; // Changed from 0.85 to 0.75 (75%)
+  private static initialized = false;
+  private static FULL_NAME_THRESHOLD = 0.85; // Full name match threshold
+  private static PARTIAL_NAME_THRESHOLD = 0.75; // Partial name match threshold
 
+  // Initialize OFAC data if not already loaded
   static async initialize() {
+    if (this.initialized) return; // Prevent re-initialization
+
     try {
-      const response = await fetch('/data/sdn_advanced.xml');
+      const response = await fetch('/data/sdn_cache.json');
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
-      const xmlText = await response.text();
-      console.log('XML file size:', xmlText.length);
-
-      const parser = new DOMParser();
-      const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
-      
-      // Get all distinct party entries
-      const distinctParties = xmlDoc.getElementsByTagName('DistinctParty');
-      console.log('Found DistinctParty entries:', distinctParties.length);
-
-      this.ofacList = Array.from(distinctParties).map(party => {
-        // Get all name parts
-        const namePartNodes = party.getElementsByTagName('NamePartValue');
-        let firstName = '';
-        let lastName = '';
-        let wholeName = '';
-        let allNameParts: string[] = [];
-
-        Array.from(namePartNodes).forEach(namePart => {
-          const nameValue = namePart.textContent || '';
-          allNameParts.push(nameValue.toLowerCase());
-
-          const nameType = namePart.parentElement?.getElementsByTagName('NamePartType')[0]?.textContent;
-          if (nameType === 'GivenName') {
-            firstName = nameValue;
-          } else if (nameType === 'Surname') {
-            lastName = nameValue;
-          } else if (nameType === 'WholeName') {
-            wholeName = nameValue;
-          }
-        });
-
-        // Get sanctions programs
-        const programNodes = party.getElementsByTagName('SanctionsProgram');
-        const programs = Array.from(programNodes).map(prog => prog.textContent || '');
-
-        // Get type
-        const type = party.getElementsByTagName('PartyType')[0]?.textContent || '';
-
-        // Construct the full name
-        const fullName = wholeName || `${lastName} ${firstName}`.trim();
-
-        return {
-          firstName,
-          lastName,
-          fullName,
-          type,
-          remarks: '',
-          programs,
-          addresses: [],
-          ids: [],
-          allText: [...allNameParts, fullName.toLowerCase()].join(' ')
-        };
-      });
-
-      console.log('Loaded SDN entries:', this.ofacList.length);
+      this.ofacList = await response.json();
+      this.initialized = true;
     } catch (error) {
       console.error('Failed to load OFAC list:', error);
     }
   }
 
-  static checkName(searchText: string): { 
-    isMatch: boolean; 
-    matchScore: number; 
-    matchedName?: string; 
-    details?: Partial<SdnEntry>;
-    matchType?: 'name' | 'address' | 'id' | 'other';
-  } {
-    searchText = searchText.toLowerCase().trim();
-    console.log('Checking name:', searchText);
-    
+  /**
+   * Check a name or entity against the OFAC list.
+   * @param searchText The text to search (name or entity).
+   * @returns Match details with score and type.
+   */
+  static async checkName(searchText: string): Promise<{
+    isMatch: boolean;
+    matchScore: number;
+    matchedEntry?: SdnEntry;
+    matchType?: 'name';
+  }> {
+    await this.initialize(); // Ensure the list is loaded
+
+    searchText = searchText?.toLowerCase().trim() || '';
     let highestScore = 0;
     let matchedEntry: SdnEntry | undefined;
 
-    // Split search text into parts
-    const searchParts = searchText.split(/[\s,]+/);
-    
-    // Create pairs of words from search text
-    const searchPairs: string[] = [];
-    for (let i = 0; i < searchParts.length - 1; i++) {
-      searchPairs.push(`${searchParts[i]} ${searchParts[i + 1]}`);
-    }
-
     for (const entry of this.ofacList) {
-      // Split entry text into parts and create pairs
-      const entryParts = entry.allText.split(/[\s,]+/);
-      const entryPairs: string[] = [];
-      for (let i = 0; i < entryParts.length - 1; i++) {
-        entryPairs.push(`${entryParts[i]} ${entryParts[i + 1]}`);
-      }
-      
-      let currentScore = 0;
-      let matchCount = 0;
+      // Calculate similarity for name
+      const fullNameScore = this.calculateSimilarity(searchText, entry.name.toLowerCase());
+      const variationScores = Array.isArray(entry.name_variations)
+        ? entry.name_variations.map(variation =>
+            this.calculateSimilarity(searchText, variation.toLowerCase())
+          )
+        : [];
 
-      // Check pairs first
-      for (const searchPair of searchPairs) {
-        let pairHighestScore = 0;
-        for (const entryPair of entryPairs) {
-          const score = this.calculateSimilarity(searchPair, entryPair);
-          pairHighestScore = Math.max(pairHighestScore, score);
-        }
-        if (pairHighestScore >= this.SIMILARITY_THRESHOLD) {
-          currentScore += pairHighestScore;
-          matchCount++;
-        }
-      }
-
-      // If we have pair matches, calculate average score
-      if (matchCount > 0) {
-        currentScore = currentScore / matchCount;
-      }
-
-      if (currentScore > highestScore) {
-        highestScore = currentScore;
+      const bestVariationScore = Math.max(fullNameScore, ...variationScores);
+      if (bestVariationScore > highestScore) {
+        highestScore = bestVariationScore;
         matchedEntry = entry;
-        
-        // Debug log for matches
-        if (currentScore >= this.SIMILARITY_THRESHOLD) {
-          console.log('Match found:', {
-            searchText,
-            matchedName: entry.fullName,
-            score: currentScore
-          });
-        }
       }
     }
 
-    const result = {
-      isMatch: highestScore >= this.SIMILARITY_THRESHOLD,
+    const isMatch = highestScore >= this.FULL_NAME_THRESHOLD || highestScore >= this.PARTIAL_NAME_THRESHOLD;
+    return {
+      isMatch,
       matchScore: highestScore,
-      matchedName: matchedEntry?.fullName,
-      matchType: 'name' as const,
-      details: matchedEntry ? {
-        type: matchedEntry.type,
-        programs: matchedEntry.programs,
-        remarks: matchedEntry.remarks
-      } : undefined
+      matchedEntry: isMatch ? matchedEntry : undefined,
+      matchType: 'name',
     };
-
-    console.log('Check result:', {
-      searchName: searchText,
-      matchScore: highestScore,
-      matchedName: matchedEntry?.fullName,
-      isMatch: result.isMatch
-    });
-
-    return result;
   }
 
+  /**
+   * Calculate similarity score between two strings.
+   * @param str1 First string.
+   * @param str2 Second string.
+   * @returns A similarity score between 0.0 and 1.0.
+   */
   private static calculateSimilarity(str1: string, str2: string): number {
     if (str1 === str2) return 1.0;
-    if (str1.length === 0 || str2.length === 0) return 0.0;
+    if (!str1 || !str2) return 0.0;
 
     const pairs1 = this.wordLetterPairs(str1);
     const pairs2 = this.wordLetterPairs(str2);
@@ -181,16 +88,19 @@ export class OfacChecker {
     return (2.0 * intersection) / union;
   }
 
+  /**
+   * Create letter pairs for each word in a string.
+   * @param str Input string.
+   * @returns An array of letter pairs.
+   */
   private static wordLetterPairs(str: string): string[] {
-    const pairs = [];
+    const pairs: string[] = [];
     const words = str.split(' ');
     for (const word of words) {
-      const pairsInWord = [];
       for (let i = 0; i < word.length - 1; i++) {
-        pairsInWord.push(word.substring(i, i + 2));
+        pairs.push(word.substring(i, i + 2));
       }
-      pairs.push(...pairsInWord);
     }
     return pairs;
   }
-} 
+}
